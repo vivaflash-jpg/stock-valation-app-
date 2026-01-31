@@ -1,84 +1,87 @@
 import streamlit as st
 import yfinance as yf
-import FinanceDataReader as fdr
+import pandas as pd
 
-st.set_page_config(page_title="멀티 지표 주식 계산기", layout="wide")
+st.set_page_config(page_title="히스토리컬 주식 계산기 v4.0", layout="wide")
+st.title("📊 과거 5년 평균 배수 기반 적정주가 계산기")
 
-st.title("⚖️ 지표별 맞춤형 적정주가 계산기")
-
-# 1. 사이드바: 설정 및 지표 선택
+# 1. 사이드바 입력
 with st.sidebar:
     st.header("🔍 분석 설정")
-    ticker = st.text_input("종목코드 (예: NVDA, 000660)", value="NVDA").upper()
-    
-    # 지표 선택 라디오 버튼
-    metric_choice = st.radio(
-        "사용할 평가지표 선택",
-        ('PER (수익성)', 'PSR (매출성)', 'PBR (자산성)')
-    )
-    
-    target_multiple = st.number_input(f"적용할 {metric_choice[:3]} 배수", min_value=0.0, value=15.0, step=0.5)
+    ticker_input = st.text_input("종목코드 입력 (예: AAPL, 005930)", value="AAPL").upper()
+    metric_choice = st.radio("평가지표", ('PER', 'PSR', 'PBR'))
     safety_margin = st.slider("안전 마진 (%)", 0, 50, 20)
 
-# 2. 데이터 처리 함수
-def get_advanced_data(ticker):
-    # 미국/한국 구분 로직
-    is_korea = not ticker.isalpha()
-    search_ticker = f"{ticker}.KS" if is_korea else ticker
+# 2. 데이터 수집 및 과거 배수 계산 함수
+def get_historical_multiple(symbol, mode):
+    # 한국 주식 처리
+    search_symbol = f"{symbol}.KS" if symbol.isdigit() else symbol
+    stock = yf.Ticker(search_symbol)
     
-    stock = yf.Ticker(search_ticker)
-    info = stock.info
+    # 과거 연간 재무제표 (최대 4-5년 제공)
+    if mode == 'PER':
+        hist_data = stock.financials.loc['Net Income']
+    elif mode == 'PSR':
+        hist_data = stock.financials.loc['Total Revenue']
+    else: # PBR
+        hist_data = stock.balance_sheet.loc['Stockholders Equity']
     
-    data = {
-        "name": info.get('longName', ticker),
-        "current_price": info.get('currentPrice') or info.get('regularMarketPrice'),
-        "shares": info.get('sharesOutstanding'),
-        "net_income": info.get('netIncomeToCommon'),
-        "revenue": info.get('totalRevenue'),
-        "book_value": info.get('totalAssets'), # 단순 자산총계 기준
-        "currency": "₩" if is_korea else "$"
-    }
-    return data
+    # 과거 주가 (연말 기준 시가총액 계산용)
+    shares = stock.info.get('sharesOutstanding')
+    multiples = []
+    
+    for date in hist_data.index:
+        year = date.year
+        # 해당 연도말 주가 가져오기 (대략적 산출)
+        end_of_year = f"{year}-12-30"
+        price_hist = stock.history(start=f"{year}-12-01", end=f"{year}-12-31")
+        if not price_hist.empty:
+            avg_price = price_hist['Close'].mean()
+            val = hist_data[date]
+            if val and val > 0:
+                m = (avg_price * shares) / val
+                multiples.append(m)
+                
+    avg_m = sum(multiples) / len(multiples) if multiples else 15.0 # 기본값 15
+    return stock.info, avg_m
 
-# 3. 메인 로직 실행
-if ticker:
+# 3. 메인 실행부
+if ticker_input:
     try:
-        d = get_advanced_data(ticker)
+        with st.spinner('5년치 데이터를 분석 중입니다...'):
+            info, recommended_m = get_historical_multiple(ticker_input, metric_choice)
         
-        # 선택된 지표에 따른 가치 평가액(Valuation) 설정
-        if 'PER' in metric_choice:
-            base_value = d['net_income']
-            label = "당기순이익"
-        elif 'PSR' in metric_choice:
-            base_value = d['revenue']
-            label = "연간 매출액"
-        else:
-            base_value = d['book_value']
-            label = "총 자산"
+        # 추천 배수를 입력창의 기본값으로 사용하거나 별도 표시
+        st.sidebar.success(f"💡 추천 {metric_choice}: {recommended_m:.2f}배 (5년 평균)")
+        target_multiple = st.sidebar.number_input(f"적용할 {metric_choice} 배수", value=float(round(recommended_m, 2)))
 
-        if base_value and d['shares'] and d['current_price']:
-            # 적정가 계산
-            fair_price = (base_value * target_multiple) / d['shares']
+        # 현재 데이터 가져오기
+        curr_price = info.get('currentPrice') or info.get('regularMarketPreviousClose')
+        shares = info.get('sharesOutstanding')
+        
+        if metric_choice == 'PER':
+            base_val = info.get('netIncomeToCommon')
+        elif metric_choice == 'PSR':
+            base_val = info.get('totalRevenue')
+        else:
+            base_val = info.get('totalStockholderEquity')
+
+        if base_val and shares and curr_price:
+            fair_price = (base_val * target_multiple) / shares
             buy_price = fair_price * (1 - safety_margin / 100)
-            upside = ((fair_price - d['current_price']) / d['current_price']) * 100
-
-            # 결과 리포트
-            st.header(f"📊 {d['name']} 분석 ({metric_choice[:3]} 기준)")
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("현재가", f"{d['currency']} {d['current_price']:,.2f}")
-            c2.metric("목표 적정주가", f"{d['currency']} {fair_price:,.2f}")
-            c3.metric(f"매수가 (마진 {safety_margin}%)", f"{d['currency']} {buy_price:,.2f}")
-
-            st.info(f"📌 기반 데이터: 최근 {label} {d['currency']} {base_value:,.0f}")
-
-            # 가이드 메시지
-            if upside > 0:
-                st.success(f"✅ 현재가 대비 **{upside:.1f}%** 저평가 상태입니다.")
-            else:
-                st.warning(f"❌ 현재가 대비 **{abs(upside):.1f}%** 고평가 상태입니다.")
-        else:
-            st.error("선택한 지표를 위한 재무 데이터가 부족합니다.")
-
+            # 결과 표시
+            st.subheader(f"📈 {info.get('longName')} 분석 (5년 평균 {metric_choice} 반영)")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("현재가", f"{int(curr_price):,}")
+            col2.metric(f"목표가 (멀티플 {target_multiple:.1f})", f"{int(fair_price):,}")
+            col3.metric("매수 권장가", f"{int(buy_price):,}")
+            
+            upside = ((fair_price - curr_price) / curr_price) * 100
+            st.progress(min(max(upside/100, 0.0), 1.0))
+            st.write(f"현재가 대비 예상 상승 여력: **{upside:.1f}%**")
+            
+    except Exception as e:
+        st.error(f"데이터 분석 중 오류가 발생했습니다. (재무제표가 비공개된 종목일 수 있습니다.)")
     except Exception as e:
         st.error(f"데이터 로드 중 오류 발생: {e}")
